@@ -74,4 +74,3 @@ else:
     st.markdown("1) **Renombrado XML/PDF** — usa el Ubigeo cargado.")
     st.markdown("2) **Validación Confirming** — usa el Ubigeo cargado.")
 
-
