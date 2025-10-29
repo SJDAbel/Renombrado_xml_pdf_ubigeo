@@ -1,17 +1,17 @@
 import streamlit as st
-import io, os, re, zipfile, tarfile
+import io, os, re, math, zipfile, tarfile
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
 from utils.core import (
-    build_id_facturas_por_ruc, emparejar_y_reportar  # usamos tu core para el zipeado final
+    build_id_facturas_por_ruc, emparejar_y_reportar  # tu core existente
 )
 
 # ====================== CONFIG DE SEGURIDAD ======================
-MAX_DEPTH = 3                     # Profundidad máxima de compresión anidada
+MAX_DEPTH = 3                     # Profundidad máxima para compresiones anidadas
 MAX_TOTAL_BYTES = 200 * 1024**2   # 200 MB descomprimidos
 ALLOWED_ARCHIVE_EXTS = {".zip", ".tar", ".gz", ".tgz", ".7z", ".rar"}
 
-# Soportes opcionales para 7z / rar
+# Soportes opcionales 7z / rar
 try:
     import py7zr
     _HAS_PY7ZR = True
@@ -25,7 +25,7 @@ except Exception:
     _HAS_RAR = False
 
 
-# ====================== HELPERS ARCHIVOS ======================
+# ====================== HELPERS DE ARCHIVOS ======================
 def _lower_ext(name: str) -> str:
     n = name.lower()
     if n.endswith(".tar.gz") or n.endswith(".tgz"):
@@ -93,15 +93,15 @@ def _dispatch_iter(name: str, data: bytes):
     raise ValueError(f"Extensión no soportada: {ext}")
 
 def _basename_inside(name: str) -> str:
-    """ Devuelve el nombre base aunque venga desde un comprimido: 'a.zip!/b/c.xml' -> 'c.xml' """
+    """ Devuelve el filename base aunque provenga de un comprimido: 'a.zip!/b/c.xml' -> 'c.xml' """
     inner = name.split("!/")[-1]
     return os.path.basename(inner)
 
 def colectar_xml_pdf_desde_adjuntos(uploads, max_depth=MAX_DEPTH, exclude_r_xml=True):
     """
     Recorre archivos subidos (XML, PDF o comprimidos anidados) y devuelve:
-      xml_files, pdf_files  con dicts {filename, content}
-    Opcionalmente excluye los XML cuyo filename base empiece con 'R-'.
+      xml_files, pdf_files  (cada item: {filename, content})
+    Si exclude_r_xml=True, excluye XML cuyo nombre base empiece con 'R-'.
     """
     xml_files, pdf_files = [], []
     total_bytes = 0
@@ -121,6 +121,7 @@ def colectar_xml_pdf_desde_adjuntos(uploads, max_depth=MAX_DEPTH, exclude_r_xml=
 
         if ext == ".xml":
             if exclude_r_xml and base.lower().startswith("r-"):
+                # Excluye XML 'R-*'
                 continue
             xml_files.append({"filename": name, "content": data})
             continue
@@ -148,57 +149,81 @@ def colectar_xml_pdf_desde_adjuntos(uploads, max_depth=MAX_DEPTH, exclude_r_xml=
     return xml_files, pdf_files
 
 
-# ====================== VALIDACIÓN SIMPLIFICADA (SOLO NOMBRES) ======================
-RUC_REGEX = re.compile(r"\b(\d{11})\b")
+# ====================== HELPERS DE NORMALIZACIÓN ======================
+RUC_REGEX = re.compile(r"(\d{11})")
 
-def _extract_ruc_from_filename(fname: str) -> Optional[str]:
-    m = RUC_REGEX.search(fname)
-    return m.group(1) if m else None
+def _to_safe_str(v) -> str:
+    """Convierte a str de forma segura (soporta int/float/None/NaN)."""
+    if v is None:
+        return ""
+    if isinstance(v, float) and math.isnan(v):
+        return ""
+    s = str(v)
+    if s.lower() == "nan":
+        return ""
+    return s.strip()
 
-def _to_safe_name(n: str) -> str:
-    return (n or "").strip()
+def _normalize_ruc(v) -> str:
+    """
+    Devuelve un RUC de 11 dígitos:
+      - Si v ya es 11 dígitos → ok
+      - Si v es numérico → lo convierte a entero-string
+      - Si v es texto → extrae la primera secuencia de 11 dígitos
+    Si no encuentra, retorna "".
+    """
+    s = _to_safe_str(v)
+    digits = re.sub(r"\D", "", s)
+    if len(digits) == 11:
+        return digits
+    m = RUC_REGEX.search(s)
+    return m.group(1) if m else ""
 
-def _normalize_series(s: Optional[str]) -> Optional[str]:
-    if s is None:
-        return None
-    return str(s).strip().upper()
+def _normalize_series(v) -> Optional[str]:
+    s = _to_safe_str(v)
+    return s.upper() if s else None
 
-def _normalize_corr(c: Optional[str]) -> Optional[str]:
-    if c is None:
+def _normalize_corr(v) -> Optional[str]:
+    """
+    Devuelve correlativo sin decimales/ceros a la izquierda si es numérico.
+    """
+    s = _to_safe_str(v)
+    if not s:
         return None
     try:
-        # Quita decimales si vienen de Excel
-        return str(int(float(str(c).strip())))
+        return str(int(float(s)))
     except Exception:
-        return str(c).strip()
+        if s.isdigit():
+            return str(int(s))
+        return s
 
+
+# ====================== INDEXADO Y VALIDACIÓN SIMPLIFICADA ======================
 def _build_index_by_ruc_and_tokens(xml_files, pdf_files):
     """
     Construye índices por RUC -> listas de nombres (xml_names, pdf_names).
-    Para matching fino, guardamos tokens por archivo (serie, correlativo si se detectan).
+    Extrae tokens típicos SUNAT: tipo, serie, correl.
     """
-    def parse_tokens(fname: str) -> Dict[str, str]:
-        # Busca tokens comunes en nombres SUNAT: RUC-TPO-SERIE-CORR
-        # ejemplo: 20123456789-01-F001-12345.xml
+    def parse_tokens(fname: str) -> Dict[str, Optional[str]]:
         tokens = {}
-        parts = os.path.splitext(os.path.basename(fname))[0].split("-")
+        stem = os.path.splitext(os.path.basename(fname))[0]
+        parts = stem.split("-")
+        # parts: [RUC, tipo, serie, correl, ...]
         if len(parts) >= 4:
-            # asume [RUC, tipo, serie, correl]
             tokens["tipo"] = parts[1]
-            tokens["serie"] = parts[2]
-            tokens["corr"] = parts[3]
+            tokens["serie"] = parts[2].upper() if parts[2] else None
+            try:
+                tokens["corr"] = str(int(float(parts[3])))
+            except Exception:
+                tokens["corr"] = parts[3]
         return tokens
 
     idx = {}
     for kind, flist in (("xml", xml_files), ("pdf", pdf_files)):
         for f in flist:
             base = _basename_inside(f["filename"])
-            ruc = _extract_ruc_from_filename(base) or ""
-            if not ruc:
-                # si no hay RUC, igual lo guardamos bajo clave especial
-                ruc = "_NORUC_"
-            tokens = parse_tokens(base)
-            entry = {"name": base, **tokens}
+            ruc = _normalize_ruc(base) or "_NORUC_"
+            tk = parse_tokens(base)
+            entry = {"name": base, **tk}
             idx.setdefault(ruc, {"xml": [], "pdf": []})
             idx[ruc][kind].append(entry)
     return idx
@@ -209,17 +234,17 @@ def validar_confirming_nombres_simple(
     pdf_files: List[Dict],
 ) -> Tuple[io.BytesIO, io.BytesIO, str]:
     """
-    Lee el Excel y SOLO se encarga de colocar/estandarizar las columnas:
+    Lee el Excel y SOLO se encarga de colocar/estandarizar:
       - Nombre_XML
       - Nombre_PDF
-    Estrategia de match:
-      1) Se busca por RUC (obligatorio para match).
-      2) Si existen columnas 'Serie' y 'Correlativo' en el Excel, se usan para afinar coincidencia.
-      3) Si hay múltiples candidatos, se marca como AMBIGUO.
-      4) Si no hay coincidencia, se marca como SIN_MATCH.
+    Estrategia:
+      1) Match por RUC (obligatorio para match).
+      2) Si existen columnas 'Serie' y 'Correlativo' en el Excel, se usan para afinar.
+      3) Si hay múltiples candidatos → AMBIGUO (se toma el primero y se reporta).
+      4) Si no hay coincidencia → SIN_MATCH.
     Devuelve:
       - validado_buffer (xlsx)
-      - errores_buffer (xlsx con detalle de errores)
+      - errores_buffer (xlsx con detalle)
       - errores_txt (resumen)
     """
     xls = pd.ExcelFile(io.BytesIO(excel_bytes))
@@ -230,34 +255,45 @@ def validar_confirming_nombres_simple(
 
     for sh in xls.sheet_names:
         df = xls.parse(sh)
-        # Identificar columnas clave
-        # Buscamos 'RUC' y opcionalmente 'Serie'/'Correlativo' con variantes
+
+        # Detecta RUC/Serie/Correlativo de forma tolerante
         ruc_col = None
         for c in df.columns:
-            if str(c).strip().lower() in ("ruc", "r.u.c", "ruc cliente", "ruc cedente", "ruc_pagador", "ruc pagador"):
+            if str(c).strip().lower() in (
+                "ruc", "r.u.c", "ruc cliente", "ruc cedente", "ruc_pagador", "ruc pagador"
+            ):
                 ruc_col = c
                 break
-        # Si no hay RUC, intentamos detectar uno dentro de algún campo de texto (ultimo recurso)
-        if ruc_col is None and len(df) > 0:
-            # crea columna virtual de ruc detectado
-            def detect_ruc_row(row):
-                for v in row:
-                    m = RUC_REGEX.search(str(v))
-                    if m:
-                        return m.group(1)
-                return None
-            df["_RUC_detectado_"] = df.apply(detect_ruc_row, axis=1)
-            ruc_col = "_RUC_detectado_"
 
-        serie_col = next((c for c in df.columns if str(c).strip().lower() in ("serie", "nro serie", "número de serie", "num serie")), None)
-        corr_col  = next((c for c in df.columns if str(c).strip().lower() in ("correlativo", "nro correlativo", "número correlativo", "num correlativo", "nro doc", "número de documento")), None)
+        serie_col = next(
+            (c for c in df.columns if str(c).strip().lower() in
+             ("serie", "nro serie", "número de serie", "num serie", "ser", "serie doc")),
+            None
+        )
+        corr_col = next(
+            (c for c in df.columns if str(c).strip().lower() in
+             ("correlativo", "nro correlativo", "número correlativo", "num correlativo",
+              "nro doc", "número de documento", "cor", "correl")),
+            None
+        )
 
-        # Asegura columnas de salida
+        # Crea columnas de salida si no existen
         if "Nombre_XML" not in df.columns: df["Nombre_XML"] = ""
         if "Nombre_PDF" not in df.columns: df["Nombre_PDF"] = ""
 
+        # Si no hay ruc_col, detectar por fila (último recurso)
+        if ruc_col is None and len(df) > 0:
+            def detect_ruc_row(row):
+                for v in row:
+                    r = _normalize_ruc(v)
+                    if r:
+                        return r
+                return ""
+            df["_RUC_detectado_"] = df.apply(detect_ruc_row, axis=1)
+            ruc_col = "_RUC_detectado_"
+
         for i, row in df.iterrows():
-            ruc = _to_safe_name(row.get(ruc_col)) if ruc_col else ""
+            ruc   = _normalize_ruc(row.get(ruc_col)) if ruc_col else ""
             serie = _normalize_series(row.get(serie_col)) if serie_col else None
             corr  = _normalize_corr(row.get(corr_col)) if corr_col else None
 
@@ -279,7 +315,7 @@ def validar_confirming_nombres_simple(
             elif len(xml_candidates) == 0:
                 errores_rows.append({"Hoja": sh, "Fila": i+2, "Motivo": "XML_SIN_MATCH", "Detalle": f"RUC={ruc}, Serie={serie}, Corr={corr}"})
             else:
-                df.at[i, "Nombre_XML"] = xml_candidates[0]["name"]  # toma el primero
+                df.at[i, "Nombre_XML"] = xml_candidates[0]["name"]
                 errores_rows.append({"Hoja": sh, "Fila": i+2, "Motivo": "XML_AMBIGUO", "Detalle": f"{len(xml_candidates)} candidatos; se tomó el primero."})
 
             # --- PDF ---
@@ -307,7 +343,7 @@ def validar_confirming_nombres_simple(
     validado_buffer.seek(0)
 
     errores_df = pd.DataFrame(errores_rows) if errores_rows else pd.DataFrame(
-        [{"Hoja":"-", "Fila":"-", "Motivo":"OK", "Detalle":"Sin observaciones"}]
+        [{"Hoja": "-", "Fila": "-", "Motivo": "OK", "Detalle": "Sin observaciones"}]
     )
     errores_buffer = io.BytesIO()
     with pd.ExcelWriter(errores_buffer, engine="xlsxwriter") as writer:
@@ -325,9 +361,9 @@ def validar_confirming_nombres_simple(
 
 
 # ====================== UI STREAMLIT ======================
-st.title("✅ Validación Confirming (ZIP + Nombres)")
+st.title("✅ Validación Confirming")
 
-# Gate UBIGEO como en tus otras páginas
+# Gate: Ubigeo cargado
 if "ubigeo_ready" not in st.session_state or not st.session_state["ubigeo_ready"]:
     st.error("Primero carga la tabla de Ubigeo en **Home**.")
     try:
@@ -350,14 +386,16 @@ def limpiar_pagina():
     st.session_state["val_uploader_excel_key"] = st.session_state.get("val_uploader_excel_key", 0) + 1
     st.rerun()
 
+# Barra de acciones
 cols = st.columns([1,1,6])
 with cols[0]:
     if st.button("🔄 Limpiar página", help="Reinicia para volver a cargar archivos desde cero"):
         limpiar_pagina()
 
-st.markdown("**Paso 1 – XML/PDF:** Sube **XML/PDF o comprimidos**. Se extraerán recursivamente (R-XML excluidos).")
+st.markdown("**Paso 1 – XML/PDF:** Sube **XML/PDF o comprimidos**. "
+            "Se extraerán recursivamente (XML con prefijo `R-` excluidos).")
 
-# --- Uploader (ahora acepta comprimidos) ---
+# --- Uploader que acepta comprimidos ---
 files_key = st.session_state.get("val_uploader_files_key", 0)
 files = st.file_uploader(
     "XML, PDF o comprimidos (zip/tar.gz/tgz/7z/rar)",
@@ -373,9 +411,10 @@ if files:
     st.session_state["val_xml_files"] = [x["filename"] for x in xml_files]
     st.session_state["val_pdf_files"] = [p["filename"] for p in pdf_files]
 
-    st.success(f"Detectados: XML={len(xml_files)} | PDF={len(pdf_files)} (incluye contenido en comprimidos; XML 'R-*' excluidos)")
+    st.success(f"Detectados: XML={len(xml_files)} | PDF={len(pdf_files)} "
+               f"(incluye contenido en comprimidos; XML 'R-*' excluidos)")
 
-    # 2) Opcional: renombrado/orden (usamos tu core)
+    # 2) Reordenamiento/renombrado (usa tu core existente)
     resultado_ordenado, excel_report_buffer, rep_emp_txt, rep_err_txt = emparejar_y_reportar(
         xml_files, pdf_files, df_ubi
     )
@@ -387,12 +426,12 @@ if files:
     st.subheader("⚠ reporte_errores.txt")
     st.code(rep_err_txt)
 
-    # 3) Índice por RUC desde XML (si lo quieres seguir usando en otros puntos)
+    # 3) Índice opcional por RUC desde XML (si lo requieres en otros pasos)
     id_facturas_por_ruc = build_id_facturas_por_ruc(xml_files)
     st.session_state["val_id_idx"] = id_facturas_por_ruc
 
     st.markdown("---")
-    st.subheader("Paso 2 – Sube Excel de Confirming (solo ajustar nombres de documentos)")
+    st.subheader("Paso 2 – Sube Excel de Confirming (solo completar nombres de documentos)")
 
     # --- Uploader de Excel ---
     excel_key = st.session_state.get("val_uploader_excel_key", 0)
@@ -403,7 +442,7 @@ if files:
     )
 
     if excel_file:
-        # VALIDACIÓN SIMPLIFICADA: solo nombres
+        # 4) VALIDACIÓN SIMPLIFICADA: solo Nombre_XML / Nombre_PDF
         validado_buffer, errores_buffer, errores_txt = validar_confirming_nombres_simple(
             excel_file.read(),
             xml_files=xml_files,
@@ -433,7 +472,9 @@ if files:
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
             for name, content in resultado_ordenado:
-                zf.writestr(name, content)
+                # Limpia notación de rutas anidadas
+                safe_name = name.replace("!/", "__")
+                zf.writestr(safe_name, content)
             if excel_report_buffer is not None:
                 zf.writestr("reporte_ubigeo.xlsx", excel_report_buffer.getvalue())
         zip_buffer.seek(0)
@@ -445,4 +486,3 @@ if files:
         )
 else:
     st.info("Sube tus XML/PDF o comprimidos para comenzar.")
-
