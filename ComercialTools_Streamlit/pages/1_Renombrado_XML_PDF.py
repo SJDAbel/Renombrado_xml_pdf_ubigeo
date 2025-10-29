@@ -1,12 +1,10 @@
 import streamlit as st
-import io, zipfile, tarfile
+import io, zipfile, tarfile, os
 from utils.core import emparejar_y_reportar
 
 # ====================== CONFIG DE SEGURIDAD ======================
 MAX_DEPTH = 3                     # Profundidad máxima de compresión anidada
-MAX_TOTAL_BYTES = 200 * 1024**2   # 200 MB descomprimidos (ajusta según tu realidad)
-
-# Extensiones de contenedores soportadas (amplía/recorta si gustas)
+MAX_TOTAL_BYTES = 200 * 1024**2   # 200 MB descomprimidos
 ALLOWED_ARCHIVE_EXTS = {".zip", ".tar", ".gz", ".tgz", ".7z", ".rar"}
 
 # Soportes opcionales
@@ -23,7 +21,7 @@ except Exception:
     _HAS_RAR = False
 
 
-# ====================== HELPERS DE ARCHIVOS ======================
+# ====================== HELPERS ======================
 def _lower_ext(name: str) -> str:
     n = name.lower()
     if n.endswith(".tar.gz") or n.endswith(".tgz"):
@@ -40,7 +38,7 @@ def _safe_add(total_bytes: int, add: int) -> int:
     new_total = total_bytes + add
     if new_total > MAX_TOTAL_BYTES:
         raise ValueError(
-            f"Se superó el límite de tamaño total descomprimido ({MAX_TOTAL_BYTES/1024**2:.0f} MB)."
+            f"Se superó el límite total descomprimido ({MAX_TOTAL_BYTES/1024**2:.0f} MB)."
         )
     return new_total
 
@@ -52,7 +50,6 @@ def _iter_zip(data: bytes):
             yield info.filename, zf.read(info)
 
 def _iter_tar_like(data: bytes):
-    # Soporta .tar, .tar.gz, .tgz, .gz (si es tar.gz) vía tarfile
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
         for m in tf.getmembers():
             if not m.isfile():
@@ -89,21 +86,32 @@ def _dispatch_iter(name: str, data: bytes):
         return _iter_7z(data)
     if ext == ".rar":
         return _iter_rar(data)
-    raise ValueError(f"Extensión de archivo no soportada: {ext}")
+    raise ValueError(f"Extensión no soportada: {ext}")
 
+def _basename_inside(name: str) -> str:
+    """
+    Devuelve el nombre base del archivo, incluso si viene de dentro de un comprimido.
+    'outer.zip!/carpeta/archivo.xml' -> 'archivo.xml'
+    """
+    # Toma la parte después del último '!/' si existe
+    inner = name.split("!/")[-1]
+    # Luego toma solo el filename
+    return os.path.basename(inner)
+
+
+# ====================== LÓGICA DE EXTRACCIÓN ======================
 def colectar_xml_pdf_desde_adjuntos(uploads, max_depth=MAX_DEPTH):
     """
-    Recorre archivos subidos (XML, PDF o comprimidos). Si son comprimidos,
-    los abre recursivamente hasta max_depth y junta todos los XML/PDF encontrados.
-    Devuelve (xml_files, pdf_files) donde cada elemento es {filename, content}.
+    Recorre archivos subidos (XML, PDF o comprimidos).
+    Excluye únicamente los XML cuyo nombre base comience con 'R-'.
+    Devuelve (xml_files, pdf_files, skipped_r_xml_count).
     """
     xml_files, pdf_files = [], []
+    skipped_r_xml = 0
     total_bytes = 0
-
     from collections import deque
     q = deque()
 
-    # Carga inicial: convierte cada upload en bytes
     for up in uploads:
         name = up.name
         data = up.read()
@@ -113,19 +121,24 @@ def colectar_xml_pdf_desde_adjuntos(uploads, max_depth=MAX_DEPTH):
     while q:
         name, data, depth = q.popleft()
         ext = _lower_ext(name)
+        base = _basename_inside(name)
 
-        # Si es XML o PDF, agregar
         if ext == ".xml":
+            # Solo excluir XML que comiencen con 'R-'
+            if base.lower().startswith("r-"):
+                skipped_r_xml += 1
+                continue
             xml_files.append({"filename": name, "content": data})
             continue
+
         if ext == ".pdf":
+            # Los PDF no se excluyen
             pdf_files.append({"filename": name, "content": data})
             continue
 
-        # Si es contenedor comprimido
         if _is_archive(name):
             if depth >= max_depth:
-                st.warning(f"Se omitió contenido anidado en '{name}' por superar MAX_DEPTH={max_depth}.")
+                st.warning(f"Se omitió contenido anidado en '{name}' (profundidad > {max_depth}).")
                 continue
             try:
                 for inner_name, inner_bytes in _dispatch_iter(name, data):
@@ -134,20 +147,17 @@ def colectar_xml_pdf_desde_adjuntos(uploads, max_depth=MAX_DEPTH):
                     if _is_archive(inner_name):
                         q.append((composed, inner_bytes, depth + 1))
                     else:
-                        # Reinyecta para que pase por la misma clasificación (xml/pdf)
                         q.append((composed, inner_bytes, depth))
             except Exception as e:
                 st.error(f"No se pudo leer el archivo comprimido '{name}': {e}")
                 continue
-        # Otros tipos de archivo se ignoran silenciosamente
 
-    return xml_files, pdf_files
+    return xml_files, pdf_files, skipped_r_xml
 
 
-# ====================== UI Y FLUJO PRINCIPAL ======================
+# ====================== UI STREAMLIT ======================
 st.title("📄 Renombrado de XML/PDF")
 
-# Chequeo de prerequisito UBIGEO (tu lógica original)
 if "ubigeo_ready" not in st.session_state or not st.session_state["ubigeo_ready"]:
     st.error("Primero carga la tabla de Ubigeo en **Home**.")
     try:
@@ -158,42 +168,40 @@ if "ubigeo_ready" not in st.session_state or not st.session_state["ubigeo_ready"
 
 df_ubi = st.session_state["ubigeo_df"]
 
-# Reset helper (tu lógica original)
 def limpiar_pagina():
     for k in [
         "ren_xml_files", "ren_pdf_files",
         "ren_resultado_zip", "ren_reporte_emparejamientos",
         "ren_reporte_errores"
     ]:
-        if k in st.session_state:
-            del st.session_state[k]
+        st.session_state.pop(k, None)
     st.session_state["ren_uploader_key"] = st.session_state.get("ren_uploader_key", 0) + 1
     st.rerun()
 
 cols = st.columns([1,1,6])
 with cols[0]:
-    if st.button("🔄 Limpiar página", help="Reinicia la página para volver a cargar desde cero"):
+    if st.button("🔄 Limpiar página"):
         limpiar_pagina()
 
-# Uploader extendido
 uploader_key = st.session_state.get("ren_uploader_key", 0)
 files = st.file_uploader(
-    "Sube tus archivos XML, PDF o comprimidos",
+    "Sube tus archivos XML, PDF o comprimidos (se excluirán solo los XML que empiecen con 'R-')",
     type=["xml", "pdf", "zip", "tar", "gz", "tgz", "7z", "rar"],
     accept_multiple_files=True,
     key=f"ren_uploader_{uploader_key}"
 )
 
 if files:
-    # Extrae y clasifica todo (incluye compresiones anidadas)
-    xml_files, pdf_files = colectar_xml_pdf_desde_adjuntos(files)
+    xml_files, pdf_files, skipped_r = colectar_xml_pdf_desde_adjuntos(files)
 
     st.session_state["ren_xml_files"] = [x["filename"] for x in xml_files]
     st.session_state["ren_pdf_files"] = [p["filename"] for p in pdf_files]
 
-    st.success(f"Detectados: XML={len(xml_files)} | PDF={len(pdf_files)} (incluye contenido dentro de comprimidos)")
+    st.success(
+        f"Detectados: XML={len(xml_files)} | PDF={len(pdf_files)}. "
+        f"Excluidos por 'R-': {skipped_r} XML."
+    )
 
-    # Procesa con tu core
     resultado_ordenado, excel_report_buffer, rep_emp_txt, rep_err_txt = emparejar_y_reportar(
         xml_files, pdf_files, df_ubi
     )
@@ -207,12 +215,10 @@ if files:
     st.subheader("⚠ reporte_errores")
     st.code(rep_err_txt)
 
-    # Empaqueta resultado final para descarga
-    import zipfile as _zip
     zip_buffer = io.BytesIO()
-    with _zip.ZipFile(zip_buffer, 'w', _zip.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
         for name, content in resultado_ordenado:
-            # Opcional: limpiar los "!/" de la ruta compuesta
+            # Limpia la notación de ruta de archivos anidados
             safe_name = name.replace("!/", "__")
             zf.writestr(safe_name, content)
         if excel_report_buffer is not None:
@@ -220,10 +226,11 @@ if files:
     zip_buffer.seek(0)
 
     st.download_button(
-        "Descargar resultado (ZIP)",
+        "⬇ Descargar resultado (ZIP)",
         data=zip_buffer.getvalue(),
         file_name="Resultado_emparejamiento_xml_pdf_ubigeo.zip",
         mime="application/zip"
     )
 else:
-    st.info("Carga archivos (XML/PDF o comprimidos) para comenzar.")
+    st.info("Carga archivos XML/PDF o comprimidos para comenzar (solo se excluirán los XML que empiecen con 'R-').")
+
